@@ -26,26 +26,29 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 def _build_database_url() -> str:
     url = os.getenv(
         "DATABASE_URL",
-        "postgresql+asyncpg://postgres:Jarrah852003@localhost:5432/telematics",
+        "sqlite+aiosqlite:///./telematics.db",  # Safe local fallback
     )
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+asyncpg://", 1)
-    elif url.startswith("postgresql://"):
+    elif url.startswith("postgresql://") and "+asyncpg" not in url:
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
     return url
 
 
 DATABASE_URL = _build_database_url()
 
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=os.getenv("SQL_ECHO", "false").lower() == "true",
-    pool_size=int(os.getenv("DB_POOL_SIZE", "10")),
-    max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "20")),
-    pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "30")),
-    pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "1800")),
-    pool_pre_ping=True,
-)
+if DATABASE_URL.startswith("sqlite"):
+    engine = create_async_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+else:
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=os.getenv("SQL_ECHO", "false").lower() == "true",
+        pool_size=int(os.getenv("DB_POOL_SIZE", "10")),
+        max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "20")),
+        pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "30")),
+        pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "1800")),
+        pool_pre_ping=True,
+    )
 
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
