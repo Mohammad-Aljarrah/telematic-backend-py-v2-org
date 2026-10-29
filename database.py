@@ -26,7 +26,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 def _build_database_url() -> str:
     url = os.getenv(
         "DATABASE_URL",
-        "sqlite+aiosqlite:///./telematics.db",  # Safe local fallback
+        "sqlite+aiosqlite:////tmp/telematics.db",  # Safe local fallback
     )
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+asyncpg://", 1)
