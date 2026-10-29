@@ -331,8 +331,7 @@ async def get_trip(
 
 
 @app.get("/health", tags=["health"])
-async def health(session: AsyncSession = Depends(get_session)) -> dict:
-    await session.execute(select(1))
+async def health() -> dict:
     return {"status": "ok"}
 
 
