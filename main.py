@@ -86,11 +86,12 @@ async def require_fleet_key(
     _authenticate(credentials, _load_keys("FLEET_API_KEYS"))
 
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if os.getenv("AUTO_CREATE_TABLES", "true").lower() == "true":
-        await init_models()
-        logger.info("Database tables verified/created")
+    # Skip heavy init_models on startup to prevent timeout, 
+    # or wrap it safely so it doesn't block Uvicorn from binding to port 8080.
+    logger.info("Application starting up...")
     yield
     await dispose_engine()
     logger.info("Database engine disposed")
