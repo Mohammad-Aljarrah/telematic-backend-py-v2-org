@@ -67,7 +67,7 @@ class Driver(Base):
     __tablename__ = "drivers"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
     plate_no: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
     car_type: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     registered_at: Mapped[datetime] = mapped_column(
@@ -87,6 +87,7 @@ class Driver(Base):
     )
 
     __table_args__ = (
+        UniqueConstraint("name", name="uq_drivers_name"),
         CheckConstraint("total_trips >= 0", name="ck_drivers_total_trips_nonneg"),
         CheckConstraint(
             "current_collective_score >= 0 AND current_collective_score <= 100",

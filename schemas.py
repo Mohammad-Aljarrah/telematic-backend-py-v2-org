@@ -17,10 +17,6 @@ class HarshEventType(str, Enum):
     HARSH_CORNERING = "harsh_cornering"
 
 
-# ---------------------------------------------------------------------------
-# Incoming mobile payload
-# ---------------------------------------------------------------------------
-
 class CoordinateIn(BaseModel):
     timestamp: AwareDatetime
     latitude: float = Field(..., ge=-90.0, le=90.0)
@@ -36,15 +32,11 @@ class HarshEventIn(BaseModel):
     g_force: float = Field(..., ge=0.0, le=20.0)
 
 
-from pydantic import BaseModel, Field, AwareDatetime, model_validator, ConfigDict
-from typing import Optional, List
-from datetime import datetime
-
 class TripIn(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
-    driver_id: int = Field(..., gt=0)
-    name: Optional[str] = Field(default=None, alias="driver_name", description="Driver Name")
+    driver_id: Optional[int] = Field(default=None, description="Optional client driver ID")
+    name: str = Field(..., alias="driver_name", description="Unique Driver Name / Handle")
     plate_no: Optional[str] = Field(default=None, alias="plate_number", description="Vehicle Plate Number")
     car_type: Optional[str] = Field(default=None, description="Vehicle Car Type")
     start_time: AwareDatetime
@@ -61,6 +53,8 @@ class TripIn(BaseModel):
     def validate_time_window(self) -> "TripIn":
         if self.end_time <= self.start_time:
             raise ValueError("end_time must be later than start_time")
+        if not self.name or not self.name.strip():
+            raise ValueError("Driver name is required")
         return self
 
 
@@ -77,10 +71,6 @@ class TripSummaryOut(BaseModel):
     corner_score: float
     collective_score: float
 
-
-# ---------------------------------------------------------------------------
-# Outgoing responses
-# ---------------------------------------------------------------------------
 
 class CoordinateOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)

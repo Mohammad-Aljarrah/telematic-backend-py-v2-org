@@ -15,7 +15,7 @@ from sqlalchemy import func, insert, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-# hi
+
 from database import (
     Coordinate,
     Driver,
@@ -86,11 +86,8 @@ async def require_fleet_key(
     _authenticate(credentials, _load_keys("FLEET_API_KEYS"))
 
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Skip heavy init_models on startup to prevent timeout, 
-    # or wrap it safely so it doesn't block Uvicorn from binding to port 8080.
     logger.info("Application starting up...")
     yield
     await dispose_engine()
@@ -99,7 +96,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Telematics API",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -185,15 +182,16 @@ async def ingest_trip(
     session: AsyncSession = Depends(get_session),
 ) -> TripCreatedOut:
     try:
+        driver_name = payload.name.strip()
+        # Look up driver by unique name instead of client-provided ID
         driver_result = await session.execute(
-            select(Driver).where(Driver.id == payload.driver_id).with_for_update()
+            select(Driver).where(Driver.name == driver_name).with_for_update()
         )
         driver = driver_result.scalar_one_or_none()
         
         if driver is None:
             driver = Driver(
-                id=payload.driver_id,
-                name=payload.name or f"Driver {payload.driver_id}",
+                name=driver_name,
                 plate_no=payload.plate_no,
                 car_type=payload.car_type,
                 total_trips=0,
@@ -203,9 +201,6 @@ async def ingest_trip(
             await session.flush()
         else:
             updated = False
-            if payload.name and driver.name != payload.name:
-                driver.name = payload.name
-                updated = True
             if payload.plate_no and driver.plate_no != payload.plate_no:
                 driver.plate_no = payload.plate_no
                 updated = True
@@ -224,7 +219,7 @@ async def ingest_trip(
         )
 
         trip = Trip(
-            driver_id=payload.driver_id,
+            driver_id=driver.id,
             start_time=payload.start_time,
             end_time=payload.end_time,
             distance_km=payload.distance_km,
@@ -292,7 +287,7 @@ async def ingest_trip(
         raise
     except SQLAlchemyError:
         await session.rollback()
-        logger.exception("Database error while ingesting trip for driver %s", payload.driver_id)
+        logger.exception("Database error while ingesting trip for driver %s", payload.name)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to store trip",
