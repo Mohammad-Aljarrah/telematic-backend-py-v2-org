@@ -24,10 +24,11 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 def _build_database_url() -> str:
-    url = os.getenv(
-        "DATABASE_URL",
-        "sqlite+aiosqlite:////tmp/telematics.db",  # Safe local fallback
-    )
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        if os.getenv("K_SERVICE"):  # running on Cloud Run
+            raise RuntimeError("DATABASE_URL is not set")
+        url = "sqlite+aiosqlite:////tmp/telematics.db"  # local dev only
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+asyncpg://", 1)
     elif url.startswith("postgresql://") and "+asyncpg" not in url:
