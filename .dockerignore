@@ -1,0 +1,39 @@
+# Files that must not be copied into the Docker image
+
+# Git
+.git
+.gitignore
+
+# Secrets and local configuration
+.env
+.env.*
+*.pem
+*.key
+service-account*.json
+
+# Python caches and virtual environments
+**/__pycache__
+*.py[cod]
+venv/
+.venv/
+env/
+ENV/
+
+# Local databases and logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Editors, tests and tool caches
+.vscode/
+.idea/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Not needed at run time (the SQL file is run by hand, not by the app)
+migrate_all.sql
+migration_*.sql
+Dockerfile
+.dockerignore

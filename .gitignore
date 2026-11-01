@@ -32,12 +32,34 @@ ENV/
 env/
 .venv/
 
-# Environment variables / secrets
+# Environment variables / secrets (keep a safe template named .env.example)
 .env
+.env.*
+!.env.example
 .venv
+*.pem
+*.key
+service-account*.json
+
+# Local databases and logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Test and tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # IDEs and Editors
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# Operating system files
+.DS_Store
+Thumbs.db
