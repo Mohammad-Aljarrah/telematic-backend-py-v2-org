@@ -1,31 +1,44 @@
+import hashlib
 import hmac
 import logging
 import os
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import FrozenSet, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, FrozenSet, List, Optional
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import func, insert, select
+from sqlalchemy import func, insert, or_, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 
 from database import (
     Coordinate,
+    Device,
     Driver,
     HarshEvent,
     Trip,
+    Vehicle,
     dispose_engine,
     get_session,
-    init_models,
 )
-from schemas import DriverOut, TripCreatedOut, TripDetailOut, TripIn
+from schemas import (
+    DriverCreate,
+    DriverOut,
+    DriverRestoreIn,
+    RecoveryCodeOut,
+    TripCreatedOut,
+    TripDetailOut,
+    TripIn,
+    TripSummaryOut,
+)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -39,11 +52,20 @@ SPEED_WEIGHT = 0.40
 BRAKE_WEIGHT = 0.35
 CORNER_WEIGHT = 0.25
 
+# Older app builds do not send driver_uid. While true, such uploads are attached to the
+# oldest driver with the same name (and never overwrite that driver's details).
+# Set ALLOW_LEGACY_DRIVER_LOOKUP=false once every phone runs the new app.
+ALLOW_LEGACY_DRIVER_LOOKUP = os.getenv("ALLOW_LEGACY_DRIVER_LOOKUP", "true").lower() == "true"
+
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
+# --------------------------------------------------------------------------- #
+# Authentication
+# --------------------------------------------------------------------------- #
 def _load_keys(env_name: str) -> FrozenSet[str]:
-    raw = os.getenv(env_name, "Jarrah852003")
+    # No default key: if the variable is unset the endpoints answer 503.
+    raw = os.getenv(env_name, "")
     return frozenset(k.strip() for k in raw.split(",") if k.strip())
 
 
@@ -86,6 +108,9 @@ async def require_fleet_key(
     _authenticate(credentials, _load_keys("FLEET_API_KEYS"))
 
 
+# --------------------------------------------------------------------------- #
+# App setup
+# --------------------------------------------------------------------------- #
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Application starting up...")
@@ -94,16 +119,24 @@ async def lifespan(app: FastAPI):
     logger.info("Database engine disposed")
 
 
+def _cors_origins() -> List[str]:
+    raw = os.getenv("CORS_ORIGINS", "*")
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    return origins or ["*"]
+
+
 app = FastAPI(
     title="Telematics API",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
+# Auth uses a Bearer header (no cookies), so credentials are not needed.
+# Set CORS_ORIGINS=https://your-dashboard.vercel.app to restrict browser access.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins(),
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -136,9 +169,75 @@ async def request_context_middleware(request: Request, call_next):
     return response
 
 
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
 def compute_collective_score(speed: float, brake: float, corner: float) -> float:
     score = speed * SPEED_WEIGHT + brake * BRAKE_WEIGHT + corner * CORNER_WEIGHT
     return round(min(100.0, max(0.0, score)), 2)
+
+
+def _clean(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _normalize_plate(value: Optional[str]) -> Optional[str]:
+    value = _clean(value)
+    return value.upper() if value else None
+
+
+# One-time recovery codes: a fleet manager issues one for a driver, the driver types it into the
+# app to restore their profile on a new phone or to reset a forgotten password.
+# Set RECOVERY_CODE_PEPPER to a long random secret so stored hashes cannot be guessed offline.
+RECOVERY_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"  # no 0/O, 1/I/L
+RECOVERY_CODE_LENGTH = 8
+RECOVERY_CODE_TTL = timedelta(hours=24)
+RECOVERY_MAX_FAILURES = 5
+
+
+def _generate_recovery_code() -> str:
+    return "".join(secrets.choice(RECOVERY_ALPHABET) for _ in range(RECOVERY_CODE_LENGTH))
+
+
+def _normalize_recovery_code(raw: str) -> str:
+    return "".join(ch for ch in raw.upper() if ch.isalnum())
+
+
+def _hash_recovery_code(code: str) -> str:
+    pepper = os.getenv("RECOVERY_CODE_PEPPER", "")
+    return hashlib.sha256((pepper + code).encode("utf-8")).hexdigest()
+
+
+def _clear_recovery_code(driver: Driver) -> None:
+    driver.recovery_code_hash = None
+    driver.recovery_expires_at = None
+    driver.recovery_failures = 0
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def driver_to_dict(
+    driver: Driver,
+    device_uid: Optional[str],
+    total_distance_km: Optional[float] = None,
+) -> Dict[str, Any]:
+    return {
+        "id": driver.id,
+        "driver_uid": driver.driver_uid,
+        "name": driver.name,
+        "plate_no": driver.plate_no,
+        "car_type": driver.car_type,
+        "device_uid": device_uid,
+        "registered_at": driver.registered_at,
+        "total_trips": driver.total_trips,
+        "current_collective_score": driver.current_collective_score,
+        "total_distance_km": total_distance_km,
+    }
 
 
 async def recompute_driver_profile(session: AsyncSession, driver: Driver) -> None:
@@ -159,6 +258,124 @@ async def recompute_driver_profile(session: AsyncSession, driver: Driver) -> Non
     driver.current_collective_score = round(float(aggregate_score), 2)
 
 
+async def _get_or_create_device(
+    session: AsyncSession, device_uid: str, model: Optional[str]
+) -> Device:
+    device_uid = device_uid.strip()
+    result = await session.execute(select(Device).where(Device.device_uid == device_uid))
+    device = result.scalar_one_or_none()
+    if device is not None:
+        if model and not device.model:
+            device.model = model.strip()
+        return device
+    try:
+        async with session.begin_nested():
+            device = Device(device_uid=device_uid, model=_clean(model))
+            session.add(device)
+            await session.flush()
+    except IntegrityError:
+        result = await session.execute(select(Device).where(Device.device_uid == device_uid))
+        device = result.scalar_one()
+    return device
+
+
+async def _get_or_create_vehicle(
+    session: AsyncSession, plate_no: str, car_type: Optional[str]
+) -> Vehicle:
+    result = await session.execute(select(Vehicle).where(Vehicle.plate_no == plate_no))
+    vehicle = result.scalar_one_or_none()
+    if vehicle is not None:
+        if car_type and not vehicle.car_type:
+            vehicle.car_type = car_type.strip()
+        return vehicle
+    try:
+        async with session.begin_nested():
+            vehicle = Vehicle(plate_no=plate_no, car_type=_clean(car_type))
+            session.add(vehicle)
+            await session.flush()
+    except IntegrityError:
+        result = await session.execute(select(Vehicle).where(Vehicle.plate_no == plate_no))
+        vehicle = result.scalar_one()
+    return vehicle
+
+
+async def _find_driver_by_uid(session: AsyncSession, driver_uid: str) -> Optional[Driver]:
+    result = await session.execute(
+        select(Driver).where(Driver.driver_uid == driver_uid).with_for_update()
+    )
+    return result.scalar_one_or_none()
+
+
+async def _claim_legacy_driver(
+    session: AsyncSession,
+    driver_uid: str,
+    name: str,
+    device_id: Optional[int],
+) -> Optional[Driver]:
+    """Adopt a pre-migration driver row (same exact name, not yet claimed) for this app identity,
+    so history recorded before multi-driver support stays attached to the right person."""
+    result = await session.execute(
+        select(Driver)
+        .where(Driver.name == name, Driver.legacy_unclaimed.is_(True))
+        .order_by(Driver.id.asc())
+        .limit(1)
+        .with_for_update()
+    )
+    legacy = result.scalar_one_or_none()
+    if legacy is None:
+        return None
+    try:
+        async with session.begin_nested():
+            legacy.driver_uid = driver_uid
+            legacy.legacy_unclaimed = False
+            if legacy.device_id is None and device_id is not None:
+                legacy.device_id = device_id
+            await session.flush()
+    except IntegrityError:
+        # Another request registered this driver_uid first.
+        return await _find_driver_by_uid(session, driver_uid)
+    logger.info("Claimed legacy driver id=%s for driver_uid=%s", legacy.id, driver_uid)
+    return legacy
+
+
+async def _create_driver(
+    session: AsyncSession,
+    *,
+    driver_uid: Optional[str],
+    name: str,
+    plate_no: Optional[str],
+    car_type: Optional[str],
+    device_id: Optional[int],
+) -> Driver:
+    uid = driver_uid or str(uuid.uuid4())
+    try:
+        async with session.begin_nested():
+            driver = Driver(
+                driver_uid=uid,
+                name=name,
+                plate_no=plate_no,
+                car_type=car_type,
+                device_id=device_id,
+                total_trips=0,
+                current_collective_score=0.0,
+            )
+            session.add(driver)
+            await session.flush()
+    except IntegrityError:
+        # Another request created the same driver_uid first.
+        existing = await _find_driver_by_uid(session, uid)
+        if existing is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Could not create driver",
+            )
+        return existing
+    return driver
+
+
+# --------------------------------------------------------------------------- #
+# Routers
+# --------------------------------------------------------------------------- #
 ingest_router = APIRouter(
     prefix="/v1/telematics",
     tags=["telematics"],
@@ -172,6 +389,127 @@ fleet_router = APIRouter(
 )
 
 
+@ingest_router.post("/drivers", response_model=DriverOut)
+async def register_driver(
+    payload: DriverCreate,
+    session: AsyncSession = Depends(get_session),
+) -> Dict[str, Any]:
+    """Driver signup from the app. Idempotent: keyed on driver_uid, never on name."""
+    try:
+        name = payload.name.strip()
+        if not name:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="name must not be empty",
+            )
+        device = await _get_or_create_device(session, payload.device_uid, payload.device_model)
+        driver = await _find_driver_by_uid(session, payload.driver_uid.strip())
+        if driver is None:
+            driver = await _claim_legacy_driver(
+                session, payload.driver_uid.strip(), name, device.id
+            )
+        if driver is None:
+            driver = await _create_driver(
+                session,
+                driver_uid=payload.driver_uid.strip(),
+                name=name,
+                plate_no=_clean(payload.plate_no),
+                car_type=_clean(payload.car_type),
+                device_id=device.id,
+            )
+        else:
+            # Explicit profile update by the driver themself.
+            driver.name = name
+            if _clean(payload.plate_no):
+                driver.plate_no = _clean(payload.plate_no)
+            if _clean(payload.car_type):
+                driver.car_type = _clean(payload.car_type)
+            if driver.device_id is None:
+                driver.device_id = device.id
+            await session.flush()
+        await session.refresh(driver)
+        response = driver_to_dict(driver, device.device_uid)
+        await session.commit()
+        return response
+    except HTTPException:
+        await session.rollback()
+        raise
+    except SQLAlchemyError:
+        await session.rollback()
+        logger.exception("Database error while registering driver %s", payload.name)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to register driver",
+        )
+
+
+@ingest_router.post("/drivers/restore", response_model=DriverOut)
+async def restore_driver(
+    payload: DriverRestoreIn,
+    session: AsyncSession = Depends(get_session),
+) -> Dict[str, Any]:
+    """Returns the driver a one-time recovery code was issued for, then burns the code.
+
+    Used by the app on a new phone, after a reinstall, or to reset a forgotten password. The code
+    must be issued by a fleet manager, is valid for 24 hours, and is revoked after 5 wrong tries.
+    """
+    try:
+        name = payload.name.strip()
+        presented = _hash_recovery_code(_normalize_recovery_code(payload.recovery_code))
+        now = datetime.now(timezone.utc)
+
+        result = await session.execute(
+            select(Driver)
+            .where(func.lower(Driver.name) == name.lower(), Driver.recovery_code_hash.is_not(None))
+            .with_for_update()
+        )
+        candidates = list(result.scalars().all())
+
+        matched: Optional[Driver] = None
+        for candidate in candidates:
+            expires = candidate.recovery_expires_at
+            if expires is None or _as_utc(expires) <= now:
+                _clear_recovery_code(candidate)
+                continue
+            if hmac.compare_digest(candidate.recovery_code_hash or "", presented):
+                matched = candidate
+                break
+
+        if matched is None:
+            for candidate in candidates:
+                if candidate.recovery_code_hash is None:  # expired and just cleared
+                    continue
+                candidate.recovery_failures += 1
+                if candidate.recovery_failures >= RECOVERY_MAX_FAILURES:
+                    _clear_recovery_code(candidate)
+            await session.commit()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invalid or expired recovery code",
+            )
+
+        device = await _get_or_create_device(session, payload.device_uid, payload.device_model)
+        _clear_recovery_code(matched)
+        matched.legacy_unclaimed = False
+        if matched.device_id is None:
+            matched.device_id = device.id
+        await session.flush()
+        response = driver_to_dict(matched, device.device_uid)
+        await session.commit()
+        logger.info("Recovery code redeemed for driver id=%s", matched.id)
+        return response
+    except HTTPException:
+        await session.rollback()
+        raise
+    except SQLAlchemyError:
+        await session.rollback()
+        logger.exception("Database error while restoring a driver")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to restore driver",
+        )
+
+
 @ingest_router.post(
     "/trips",
     response_model=TripCreatedOut,
@@ -183,32 +521,62 @@ async def ingest_trip(
 ) -> TripCreatedOut:
     try:
         driver_name = payload.name.strip()
-        # Look up driver by unique name instead of client-provided ID
-        driver_result = await session.execute(
-            select(Driver).where(Driver.name == driver_name).with_for_update()
-        )
-        driver = driver_result.scalar_one_or_none()
-        
-        if driver is None:
-            driver = Driver(
-                name=driver_name,
-                plate_no=payload.plate_no,
-                car_type=payload.car_type,
-                total_trips=0,
-                current_collective_score=0.0,
+        plate_display = _clean(payload.plate_no)
+        plate_key = _normalize_plate(payload.plate_no)
+        car_type = _clean(payload.car_type)
+
+        device: Optional[Device] = None
+        if payload.device_uid:
+            device = await _get_or_create_device(
+                session, payload.device_uid, payload.device_model
             )
-            session.add(driver)
-            await session.flush()
+
+        vehicle: Optional[Vehicle] = None
+        if plate_key:
+            vehicle = await _get_or_create_vehicle(session, plate_key, car_type)
+
+        if payload.driver_uid:
+            driver_uid = payload.driver_uid.strip()
+            driver = await _find_driver_by_uid(session, driver_uid)
+            if driver is None:
+                driver = await _claim_legacy_driver(
+                    session, driver_uid, driver_name, device.id if device else None
+                )
+            if driver is None:
+                # Driver never signed up explicitly: create it from this payload once.
+                driver = await _create_driver(
+                    session,
+                    driver_uid=driver_uid,
+                    name=driver_name,
+                    plate_no=plate_display,
+                    car_type=car_type,
+                    device_id=device.id if device else None,
+                )
+            # An existing driver is never modified by a trip upload.
         else:
-            updated = False
-            if payload.plate_no and driver.plate_no != payload.plate_no:
-                driver.plate_no = payload.plate_no
-                updated = True
-            if payload.car_type and driver.car_type != payload.car_type:
-                driver.car_type = payload.car_type
-                updated = True
-            if updated:
-                await session.flush()
+            if not ALLOW_LEGACY_DRIVER_LOOKUP:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="driver_uid is required",
+                )
+            logger.warning("Legacy trip upload without driver_uid for name=%s", driver_name)
+            legacy_result = await session.execute(
+                select(Driver)
+                .where(Driver.name == driver_name)
+                .order_by(Driver.id.asc())
+                .limit(1)
+                .with_for_update()
+            )
+            driver = legacy_result.scalar_one_or_none()
+            if driver is None:
+                driver = await _create_driver(
+                    session,
+                    driver_uid=None,
+                    name=driver_name,
+                    plate_no=plate_display,
+                    car_type=car_type,
+                    device_id=device.id if device else None,
+                )
 
         collective = (
             payload.collective_score
@@ -220,6 +588,8 @@ async def ingest_trip(
 
         trip = Trip(
             driver_id=driver.id,
+            device_id=device.id if device else None,
+            vehicle_id=vehicle.id if vehicle else None,
             start_time=payload.start_time,
             end_time=payload.end_time,
             distance_km=payload.distance_km,
@@ -298,10 +668,112 @@ async def ingest_trip(
 async def list_drivers(
     limit: int = Query(500, ge=1, le=5000),
     offset: int = Query(0, ge=0),
+    device_uid: Optional[str] = Query(None, max_length=64),
+    plate_no: Optional[str] = Query(None, max_length=50),
+    q: Optional[str] = Query(None, max_length=255, description="Name contains"),
     session: AsyncSession = Depends(get_session),
-) -> List[Driver]:
+) -> List[Dict[str, Any]]:
+    distance_by_driver = (
+        select(
+            Trip.driver_id.label("driver_id"),
+            func.coalesce(func.sum(Trip.distance_km), 0.0).label("total_km"),
+        )
+        .group_by(Trip.driver_id)
+        .subquery()
+    )
+    stmt = (
+        select(Driver, Device.device_uid, func.coalesce(distance_by_driver.c.total_km, 0.0))
+        .outerjoin(Device, Driver.device_id == Device.id)
+        .outerjoin(distance_by_driver, distance_by_driver.c.driver_id == Driver.id)
+    )
+
+    if device_uid:
+        trip_device = aliased(Device)
+        drivers_with_trips_on_device = (
+            select(Trip.driver_id)
+            .join(trip_device, Trip.device_id == trip_device.id)
+            .where(trip_device.device_uid == device_uid.strip())
+        )
+        stmt = stmt.where(
+            or_(
+                Device.device_uid == device_uid.strip(),
+                Driver.id.in_(drivers_with_trips_on_device),
+            )
+        )
+    if plate_no:
+        stmt = stmt.where(func.upper(Driver.plate_no) == plate_no.strip().upper())
+    if q:
+        stmt = stmt.where(Driver.name.ilike(f"%{q.strip()}%"))
+
+    stmt = stmt.order_by(Driver.name.asc(), Driver.id.asc()).limit(limit).offset(offset)
+    result = await session.execute(stmt)
+    return [
+        driver_to_dict(driver, dev_uid, float(total_km))
+        for driver, dev_uid, total_km in result.all()
+    ]
+
+
+@fleet_router.post("/drivers/{driver_id}/recovery-code", response_model=RecoveryCodeOut)
+async def issue_recovery_code(
+    driver_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> RecoveryCodeOut:
+    """Issues a one-time recovery code for a driver (replaces any earlier one). Shown only once."""
+    try:
+        result = await session.execute(
+            select(Driver).where(Driver.id == driver_id).with_for_update()
+        )
+        driver = result.scalar_one_or_none()
+        if driver is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Driver {driver_id} not found",
+            )
+        code = _generate_recovery_code()
+        expires_at = datetime.now(timezone.utc) + RECOVERY_CODE_TTL
+        driver.recovery_code_hash = _hash_recovery_code(code)
+        driver.recovery_expires_at = expires_at
+        driver.recovery_failures = 0
+        await session.commit()
+        logger.info("Recovery code issued for driver id=%s", driver.id)
+        return RecoveryCodeOut(
+            driver_id=driver.id,
+            driver_name=driver.name,
+            code=f"{code[:4]}-{code[4:]}",
+            expires_at=expires_at,
+        )
+    except HTTPException:
+        await session.rollback()
+        raise
+    except SQLAlchemyError:
+        await session.rollback()
+        logger.exception("Database error while issuing a recovery code")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to issue recovery code",
+        )
+
+
+@fleet_router.get("/drivers/{driver_id}/trips", response_model=List[TripSummaryOut])
+async def list_driver_trips(
+    driver_id: int,
+    limit: int = Query(200, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_session),
+) -> List[Trip]:
+    exists = await session.execute(select(Driver.id).where(Driver.id == driver_id))
+    if exists.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Driver {driver_id} not found",
+        )
     result = await session.execute(
-        select(Driver).order_by(Driver.name.asc(), Driver.id.asc()).limit(limit).offset(offset)
+        select(Trip)
+        .options(selectinload(Trip.device), selectinload(Trip.vehicle))
+        .where(Trip.driver_id == driver_id)
+        .order_by(Trip.start_time.desc(), Trip.id.desc())
+        .limit(limit)
+        .offset(offset)
     )
     return list(result.scalars().all())
 
@@ -313,7 +785,12 @@ async def get_trip(
 ) -> Trip:
     result = await session.execute(
         select(Trip)
-        .options(selectinload(Trip.coordinates), selectinload(Trip.harsh_events))
+        .options(
+            selectinload(Trip.coordinates),
+            selectinload(Trip.harsh_events),
+            selectinload(Trip.device),
+            selectinload(Trip.vehicle),
+        )
         .where(Trip.id == trip_id)
     )
     trip = result.scalar_one_or_none()
@@ -332,38 +809,3 @@ async def health() -> dict:
 
 app.include_router(ingest_router)
 app.include_router(fleet_router)
-
-
-@app.get("/v1/fleet/drivers/{driver_id}/trips")
-async def get_driver_trips_alias(driver_id: int, db = Depends(get_session)):
-    result = await db.execute(select(Trip).where(Trip.driver_id == driver_id))
-    trips = result.scalars().all()
-    return trips
-
-
-@app.get("/v1/fleet/trips/{trip_id}")
-async def get_single_trip_detail_alias(trip_id: int, db = Depends(get_session)):
-    trip_result = await db.execute(select(Trip).where(Trip.id == trip_id))
-    trip = trip_result.scalar_one_or_none()
-    if not trip:
-        raise HTTPException(status_code=404, detail="Trip history item not found")
-        
-    coords_result = await db.execute(select(Coordinate).where(Coordinate.trip_id == trip_id).order_by(Coordinate.timestamp))
-    coords = coords_result.scalars().all()
-    
-    events_result = await db.execute(select(HarshEvent).where(HarshEvent.trip_id == trip_id))
-    events = events_result.scalars().all()
-    
-    return {
-        "id": trip.id,
-        "driver_id": trip.driver_id,
-        "start_time": trip.start_time.isoformat() if trip.start_time else None,
-        "end_time": trip.end_time.isoformat() if trip.end_time else None,
-        "distance_km": trip.distance_km,
-        "speed_score": trip.speed_score,
-        "brake_score": trip.brake_score,
-        "corner_score": trip.corner_score,
-        "collective_score": trip.collective_score,
-        "coordinates": [{"latitude": c.latitude, "longitude": c.longitude, "timestamp": c.timestamp.isoformat() if c.timestamp else None, "speed_kmh": c.speed_kmh} for c in coords],
-        "harsh_events": [{"event_type": e.event_type, "latitude": e.latitude, "longitude": e.longitude, "timestamp": e.timestamp.isoformat() if e.timestamp else None, "g_force": e.g_force} for e in events]
-    }

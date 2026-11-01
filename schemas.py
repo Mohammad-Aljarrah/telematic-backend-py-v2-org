@@ -32,11 +32,50 @@ class HarshEventIn(BaseModel):
     g_force: float = Field(..., ge=0.0, le=20.0)
 
 
+class DriverCreate(BaseModel):
+    """Body of POST /v1/telematics/drivers (driver signup from the app)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    driver_uid: str = Field(..., min_length=8, max_length=64, description="UUID generated on the phone")
+    name: str = Field(..., min_length=1, max_length=255, alias="driver_name")
+    plate_no: Optional[str] = Field(default=None, max_length=50, alias="plate_number")
+    car_type: Optional[str] = Field(default=None, max_length=100)
+    device_uid: str = Field(..., min_length=8, max_length=64, description="UUID of this app install")
+    device_model: Optional[str] = Field(default=None, max_length=100)
+
+
+class DriverRestoreIn(BaseModel):
+    """Body of POST /v1/telematics/drivers/restore (new phone, reinstall or forgotten password)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str = Field(..., min_length=1, max_length=255, alias="driver_name")
+    recovery_code: str = Field(..., min_length=4, max_length=32)
+    device_uid: str = Field(..., min_length=8, max_length=64)
+    device_model: Optional[str] = Field(default=None, max_length=100)
+
+
+class RecoveryCodeOut(BaseModel):
+    """Returned once to the fleet manager; the code is never stored in plain text."""
+
+    driver_id: int
+    driver_name: str
+    code: str
+    expires_at: datetime
+
+
 class TripIn(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
+    # Legacy field from older app builds; ignored by the server.
     driver_id: Optional[int] = Field(default=None, description="Optional client driver ID")
-    name: str = Field(..., alias="driver_name", description="Unique Driver Name / Handle")
+    # New identity fields. Optional so older app builds keep working.
+    driver_uid: Optional[str] = Field(default=None, min_length=8, max_length=64)
+    device_uid: Optional[str] = Field(default=None, min_length=8, max_length=64)
+    device_model: Optional[str] = Field(default=None, max_length=100)
+
+    name: str = Field(..., alias="driver_name", description="Driver display name")
     plate_no: Optional[str] = Field(default=None, alias="plate_number", description="Vehicle Plate Number")
     car_type: Optional[str] = Field(default=None, description="Vehicle Car Type")
     start_time: AwareDatetime
@@ -58,11 +97,29 @@ class TripIn(BaseModel):
         return self
 
 
+class DeviceOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    device_uid: str
+    model: Optional[str] = None
+
+
+class VehicleOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    plate_no: Optional[str] = None
+    car_type: Optional[str] = None
+
+
 class TripSummaryOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
     driver_id: int
+    device_id: Optional[int] = None
+    vehicle_id: Optional[int] = None
+    device: Optional[DeviceOut] = None
+    vehicle: Optional[VehicleOut] = None
     start_time: datetime
     end_time: datetime
     distance_km: float
@@ -97,12 +154,15 @@ class DriverOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    driver_uid: str
     name: str
     plate_no: Optional[str] = None
     car_type: Optional[str] = None
+    device_uid: Optional[str] = None
     registered_at: datetime
     total_trips: int
     current_collective_score: float
+    total_distance_km: Optional[float] = None
 
 
 class DriverSummaryOut(DriverOut):
@@ -114,6 +174,10 @@ class TripDetailOut(BaseModel):
 
     id: int
     driver_id: int
+    device_id: Optional[int] = None
+    vehicle_id: Optional[int] = None
+    device: Optional[DeviceOut] = None
+    vehicle: Optional[VehicleOut] = None
     start_time: datetime
     end_time: datetime
     distance_km: float
