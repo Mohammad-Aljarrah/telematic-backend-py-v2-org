@@ -565,7 +565,7 @@ async def ingest_trip(
             if driver is None:
                 driver = await _create_driver(
                     session,
-                    driver_uid=str(uuid.uuid4()),,
+                    driver_uid=str(uuid.uuid4()),
                     name=driver_name,
                     plate_no=plate_display,
                     car_type=car_type,
