@@ -565,7 +565,7 @@ async def ingest_trip(
             if driver is None:
                 driver = await _create_driver(
                     session,
-                    driver_uid=None,
+                    driver_uid=str(uuid.uuid4()),,
                     name=driver_name,
                     plate_no=plate_display,
                     car_type=car_type,
@@ -816,7 +816,7 @@ class DriverRegisterIn(BaseModel):
     device_uid: Optional[str] = None
     device_model: Optional[str] = None
 
-@app.post("/v1/telematics/drivers", status_code=status.HTTP_201_CREATED)
+#@app.post("/v1/telematics/drivers", status_code=status.HTTP_201_CREATED)
 async def register_driver(
     payload: DriverRegisterIn,
     session: AsyncSession = Depends(get_session),
