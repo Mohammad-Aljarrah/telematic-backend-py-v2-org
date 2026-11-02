@@ -351,31 +351,20 @@ async def _create_driver(
     car_type: Optional[str],
     device_id: Optional[int],
 ) -> Driver:
-    # 1. Guarantee a valid string UUID even if None or empty string is passed
+    # Guarantee a valid UUID string if none was provided
     uid = driver_uid.strip() if driver_uid and driver_uid.strip() else str(uuid.uuid4())
     
-    try:
-        async with session.begin_nested():
-            driver = Driver(
-                driver_uid=uid,  # <--- Explicitly passing the generated uid here
-                name=name,
-                plate_no=plate_no,
-                car_type=car_type,
-                device_id=device_id,
-                total_trips=0,
-                current_collective_score=0.0,
-            )
-            session.add(driver)
-            await session.flush()
-    except IntegrityError:
-        # Another request created the same driver_uid first.
-        existing = await _find_driver_by_uid(session, uid)
-        if existing is None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Could not create driver",
-            )
-        return existing
+    driver = Driver(
+        driver_uid=uid,  # <--- Explicitly supplied so SQLAlchemy includes it in INSERT
+        name=name,
+        plate_no=plate_no,
+        car_type=car_type,
+        device_id=device_id,
+        total_trips=0,
+        current_collective_score=0.0,
+    )
+    session.add(driver)
+    await session.flush()
     return driver
 
 # --------------------------------------------------------------------------- #
