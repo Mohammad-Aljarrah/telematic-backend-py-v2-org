@@ -805,8 +805,8 @@ app.include_router(ingest_router)
 app.include_router(fleet_router)
 
 
-
 from pydantic import BaseModel
+from typing import Optional
 
 class DriverRegisterIn(BaseModel):
     driver_uid: str
@@ -820,7 +820,6 @@ class DriverRegisterIn(BaseModel):
 async def register_driver(
     payload: DriverRegisterIn,
     session: AsyncSession = Depends(get_session),
-    authorized: bool = Depends(verify_ingest_key),  # or your auth dependency
 ):
     # Check if driver already exists by driver_uid
     driver = await _find_driver_by_uid(session, payload.driver_uid)
@@ -835,7 +834,6 @@ async def register_driver(
         )
         session.add(driver)
     else:
-        # Update details if provided
         if payload.driver_name:
             driver.name = payload.driver_name
         if payload.plate_number:
