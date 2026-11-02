@@ -351,20 +351,31 @@ async def _create_driver(
     car_type: Optional[str],
     device_id: Optional[int],
 ) -> Driver:
-    # Guarantee a valid string UUID even if None or empty string is passed
+    # 1. Guarantee a valid string UUID even if None or empty string is passed
     uid = driver_uid.strip() if driver_uid and driver_uid.strip() else str(uuid.uuid4())
     
-    driver = Driver(
-        driver_uid=uid,  # Always a valid string now!
-        name=name,
-        plate_no=plate_no,
-        car_type=car_type,
-        device_id=device_id,
-        total_trips=0,
-        current_collective_score=0.0,
-    )
-    session.add(driver)
-    await session.flush()
+    try:
+        async with session.begin_nested():
+            driver = Driver(
+                driver_uid=uid,  # <--- Explicitly passing the generated uid here
+                name=name,
+                plate_no=plate_no,
+                car_type=car_type,
+                device_id=device_id,
+                total_trips=0,
+                current_collective_score=0.0,
+            )
+            session.add(driver)
+            await session.flush()
+    except IntegrityError:
+        # Another request created the same driver_uid first.
+        existing = await _find_driver_by_uid(session, uid)
+        if existing is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Could not create driver",
+            )
+        return existing
     return driver
 
 # --------------------------------------------------------------------------- #
