@@ -571,6 +571,14 @@ async def ingest_trip(
                     car_type=car_type,
                     device_id=device.id if device else None,
                 )
+            else:
+                # <--- FIX: Ensure legacy driver row gets a valid UUID and is claimed
+                if not driver.driver_uid:
+                    driver.driver_uid = str(uuid.uuid4())
+                driver.legacy_unclaimed = False
+                if driver.device_id is None and device:
+                    driver.device_id = device.id
+                await session.flush()
 
         collective = (
             payload.collective_score
