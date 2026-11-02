@@ -540,7 +540,7 @@ async def ingest_trip(
                 # Driver never signed up explicitly: create it from this payload once.
                 driver = await _create_driver(
                     session,
-                    driver_uid=driver_uid,
+                    driver_uid=str(uuid.uuid4()),  # <--- THIS FIXES THE NOT-NULL ERROR!
                     name=driver_name,
                     plate_no=plate_display,
                     car_type=car_type,
