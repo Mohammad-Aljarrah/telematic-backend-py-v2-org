@@ -805,41 +805,5 @@ app.include_router(ingest_router)
 app.include_router(fleet_router)
 
 
-from pydantic import BaseModel
-from typing import Optional
 
-class DriverRegisterIn(BaseModel):
-    driver_uid: str
-    driver_name: str
-    car_type: Optional[str] = None
-    plate_number: Optional[str] = None
-    device_uid: Optional[str] = None
-    device_model: Optional[str] = None
 
-#@app.post("/v1/telematics/drivers", status_code=status.HTTP_201_CREATED)
-async def register_driver(
-    payload: DriverRegisterIn,
-    session: AsyncSession = Depends(get_session),
-):
-    # Check if driver already exists by driver_uid
-    driver = await _find_driver_by_uid(session, payload.driver_uid)
-    if driver is None:
-        driver = Driver(
-            driver_uid=payload.driver_uid,
-            name=payload.driver_name,
-            plate_no=payload.plate_number,
-            car_type=payload.car_type,
-            total_trips=0,
-            current_collective_score=0.0,
-        )
-        session.add(driver)
-    else:
-        if payload.driver_name:
-            driver.name = payload.driver_name
-        if payload.plate_number:
-            driver.plate_no = payload.plate_number
-        if payload.car_type:
-            driver.car_type = payload.car_type
-
-    await session.commit()
-    return {"status": "registered", "driver_uid": driver.driver_uid}
