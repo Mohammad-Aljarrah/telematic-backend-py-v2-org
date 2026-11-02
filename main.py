@@ -351,11 +351,11 @@ async def _create_driver(
     car_type: Optional[str],
     device_id: Optional[int],
 ) -> Driver:
-    # Guarantee a valid string UID even if None or empty string is passed
+    # Guarantee a valid string UUID even if None or empty string is passed
     uid = driver_uid.strip() if driver_uid and driver_uid.strip() else str(uuid.uuid4())
     
     driver = Driver(
-        driver_uid=uid,
+        driver_uid=uid,  # Always a valid string now!
         name=name,
         plate_no=plate_no,
         car_type=car_type,
