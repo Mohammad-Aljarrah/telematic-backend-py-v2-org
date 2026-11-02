@@ -48,6 +48,7 @@ logger = logging.getLogger("telematics")
 
 INSERT_CHUNK_SIZE = 5000
 
+
 SPEED_WEIGHT = 0.40
 BRAKE_WEIGHT = 0.35
 CORNER_WEIGHT = 0.25
@@ -131,18 +132,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Auth uses a Bearer header (no cookies), so credentials are not needed.
-# Set CORS_ORIGINS=https://your-dashboard.vercel.app to restrict browser access.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_origins(),
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-app.add_middleware(GZipMiddleware, minimum_size=1024)
-
-
 @app.middleware("http")
 async def request_context_middleware(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
@@ -167,6 +156,21 @@ async def request_context_middleware(request: Request, call_next):
         elapsed_ms,
     )
     return response
+
+
+# Middleware order matters: the one added LAST is the outermost. CORS is added last on purpose so
+# that every answer, including a 500 error, carries the CORS headers. Otherwise the browser hides
+# the real error and the dashboard only says it cannot reach the API.
+# Auth uses a Bearer header (no cookies), so credentials are not needed.
+# Set CORS_ORIGINS=https://your-dashboard.vercel.app to restrict browser access.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins(),
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -347,31 +351,21 @@ async def _create_driver(
     car_type: Optional[str],
     device_id: Optional[int],
 ) -> Driver:
-    uid = driver_uid or str(uuid.uuid4())
-    try:
-        async with session.begin_nested():
-            driver = Driver(
-                driver_uid=uid,
-                name=name,
-                plate_no=plate_no,
-                car_type=car_type,
-                device_id=device_id,
-                total_trips=0,
-                current_collective_score=0.0,
-            )
-            session.add(driver)
-            await session.flush()
-    except IntegrityError:
-        # Another request created the same driver_uid first.
-        existing = await _find_driver_by_uid(session, uid)
-        if existing is None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Could not create driver",
-            )
-        return existing
+    # Guarantee a valid string UID even if None or empty string is passed
+    uid = driver_uid.strip() if driver_uid and driver_uid.strip() else str(uuid.uuid4())
+    
+    driver = Driver(
+        driver_uid=uid,
+        name=name,
+        plate_no=plate_no,
+        car_type=car_type,
+        device_id=device_id,
+        total_trips=0,
+        current_collective_score=0.0,
+    )
+    session.add(driver)
+    await session.flush()
     return driver
-
 
 # --------------------------------------------------------------------------- #
 # Routers

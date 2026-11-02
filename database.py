@@ -2,6 +2,7 @@ import os
 import uuid
 from datetime import datetime
 from typing import AsyncIterator, List, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from sqlalchemy import (
     BigInteger,
@@ -25,8 +26,32 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
+def _asyncpg_query_options(url: str) -> str:
+    """Translate libpq-style options (as copied from Neon, Render or Supabase) for asyncpg.
+
+    asyncpg rejects `sslmode` and `channel_binding` and expects `ssl` instead, so a connection
+    string pasted straight from the provider would otherwise fail to connect.
+    """
+    parts = urlsplit(url)
+    if not parts.query:
+        return url
+    pairs = parse_qsl(parts.query, keep_blank_values=True)
+    names = {key for key, _ in pairs}
+    kept = []
+    for key, value in pairs:
+        if key == "channel_binding":
+            continue
+        if key == "sslmode":
+            if "ssl" not in names:
+                kept.append(("ssl", value))
+            continue
+        kept.append((key, value))
+    return urlunsplit(parts._replace(query=urlencode(kept)))
+
+
 def _build_database_url() -> str:
-    url = os.getenv("DATABASE_URL")
+    # Strip spaces, line breaks and quotes that sneak in when a URL is pasted into a console.
+    url = (os.getenv("DATABASE_URL") or "").strip().strip("\"'")
     if not url:
         if os.getenv("K_SERVICE"):  # running on Cloud Run
             raise RuntimeError("DATABASE_URL is not set")
@@ -35,6 +60,8 @@ def _build_database_url() -> str:
         url = url.replace("postgres://", "postgresql+asyncpg://", 1)
     elif url.startswith("postgresql://") and "+asyncpg" not in url:
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    if url.startswith("postgresql+asyncpg://"):
+        url = _asyncpg_query_options(url)
     return url
 
 
